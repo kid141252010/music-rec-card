@@ -1,0 +1,1426 @@
+import argparse
+import asyncio
+import calendar
+import json
+import re
+import sys
+from datetime import datetime
+from io import BytesIO
+from typing import Optional, Dict, Any
+
+import aiohttp
+import qrcode
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageEnhance
+
+import emoji
+
+from ttml.ttml import TTML
+
+TTML_DB_URL_PREFIX = "https://amlldb.bikonoo.com"
+
+
+class MusicCard:
+    DAILY = "daily"
+    CARD = "card"
+    LYRIC = "lyric"
+    Regular = 2
+    Medium = 5
+    Semibold = 8
+    Light = 11
+    Thin = 14
+    Ultralight = 17
+
+    def _load_font(self, font_size: int, font_index: int):
+        if os.path.isdir(self.font_path):
+            weight_map = {
+                self.Semibold: "SourceHanSansSC-Bold.otf",
+                self.Medium: "SourceHanSansSC-Medium.otf",
+                self.Regular: "SourceHanSansSC-Regular.otf",
+                self.Light: "SourceHanSansSC-Light.otf",
+                self.Thin: "SourceHanSansSC-ExtraLight.otf",
+            }
+            filename = weight_map.get(font_index, "SourceHanSansSC-Regular.otf")
+            file_path = os.path.join(self.font_path, filename)
+            try:
+                return ImageFont.truetype(file_path, font_size)
+            except OSError as e:
+                print(f"思源黑体加载失败: {file_path}, 错误: {e}")
+                try:
+                    return ImageFont.truetype(
+                        os.path.join(self.font_path, "SourceHanSansSC-Regular.otf"),
+                        font_size,
+                    )
+                except OSError:
+                    return ImageFont.load_default()
+        else:
+            try:
+                return ImageFont.truetype(self.font_path, font_size, index=font_index)
+            except OSError:
+                try:
+                    return ImageFont.truetype(self.font_path, font_size, index=0)
+                except OSError as e:
+                    print(f"字体加载彻底失败: {self.font_path}, 错误: {e}")
+                    return ImageFont.load_default()
+
+    def __init__(
+        self, font_path: str, platform: str = "ncm", am_storefront: str = "cn"
+    ):
+        self.font_path = font_path
+        self.platform = platform
+        self.am_storefront = am_storefront
+
+        # 布局常量
+        self.W = 1000
+        self.MARGIN_TOP = 40
+        self.MARGIN_SIDE = 40
+        self.MARGIN_BOTTOM = 90
+        self.CARD_W = self.W - (self.MARGIN_SIDE * 2)
+        self.INNER_PAD = 40
+        self.CONTENT_LEFT_X = self.MARGIN_SIDE + self.INNER_PAD
+        self.CONTENT_RIGHT_X = self.MARGIN_SIDE + self.CARD_W - self.INNER_PAD
+        self.MAX_TEXT_W = self.CARD_W - (self.INNER_PAD * 2)
+
+        # 颜色常量
+        self.C_MAIN = "#2A2A2A"
+        self.C_SUB = "#555555"
+        self.C_QUOTE = "#4A4A4A"
+        self.C_ACCENT = "#D0D0D0"
+        self.C_FOOTER_CENTER = "#555555"
+
+    # --- 数据获取 ---
+
+    @staticmethod
+    async def download_image(url: str) -> Image.Image:
+        """[异步] 下载图片"""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+        }
+        if not url:
+            return Image.new("RGB", (600, 600), color="#D3D3D3")
+        try:
+            async with aiohttp.ClientSession(
+                headers=headers, trust_env=True
+            ) as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status != 200:
+                        print(f"图片下载失败: {resp.status}，尝试使用 TLS 指纹...")
+                        try:
+                            from curl_cffi import requests
+
+                            response = requests.get(url, impersonate="chrome110")
+                            return Image.open(BytesIO(response.content))
+                        except Exception as e:
+                            print(f"图片下载出错: {e}")
+                        return Image.new("RGB", (600, 600), color="#D3D3D3")
+                    content = await resp.read()
+                    return Image.open(BytesIO(content))
+        except Exception as e:
+            print(f"图片下载出错: {e}")
+            return Image.new("RGB", (600, 600), color="#D3D3D3")
+
+    @staticmethod
+    async def fetch_ncm_song_info(music_id: str) -> Optional[Dict]:
+        """[异步] 获取网易云音乐歌曲详情"""
+        url = (
+            f"https://music.163.com/api/song/detail/?id={music_id}&ids=%5B{music_id}%5D"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        }
+        print(f"正在从 NCM API 获取 ID {music_id} 的信息...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        return None
+                    text_resp = await resp.text()
+                    data = json.loads(text_resp)
+                    if not data.get("songs"):
+                        return None
+                    song = data["songs"][0]
+                    return {
+                        "title": song["name"],
+                        "artist": " / ".join([a["name"] for a in song["artists"]]),
+                        "cover_url": song["album"]["picUrl"],
+                        "music_id": music_id,
+                    }
+        except Exception as e:
+            print(f"NCM API Error: {e}")
+            return None
+
+    @staticmethod
+    async def get_final_url(
+        url: str, max_redirects: int = 10, timeout: int = 30
+    ) -> Optional[str]:
+        """
+        获取URL的最终目标地址（简化版本）
+
+        Args:
+            url: 初始URL
+            max_redirects: 最大重定向次数
+            timeout: 超时时间（秒）
+
+        Returns:
+            最终重定向的URL，如果出错返回None
+        """
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+
+            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+                # 自动跟随重定向，获取最终URL
+                async with session.get(
+                    url, allow_redirects=True, max_redirects=max_redirects
+                ) as response:
+                    return str(response.url)
+
+        except Exception as e:
+            print(f"获取最终URL时出错: {e}")
+            return None
+
+    @staticmethod
+    async def fetch_qq_music_info(music_id: str) -> Optional[Dict]:
+        """[异步] 获取 QQ 音乐歌曲详情"""
+        # match ^[0-9a-zA-Z]+$
+        if not re.match(r"^[0-9a-zA-Z]+$", music_id):
+            # match u\?__=[0-9a-zA-Z]
+            if re.findall(r"u\?__=[0-9a-zA-Z]", music_id):
+                org_url = await MusicCard.get_final_url(music_id)
+                if org_url is None:
+                    return None
+                music_id = org_url
+
+            # (songDetail/|songmid=)([0-9a-zA-Z]+)
+            match = re.search(r"(songDetail/|songmid=)([0-9a-zA-Z]+)", music_id)
+            if match:
+                music_id = match.group(2)
+            else:
+                return None
+
+        print(f"正在访问 QQ 音乐网页端获取 ID {music_id} 的信息...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                req_body = {
+                    "comm": {"ct": "26", "cv": "2010101", "v": "2010101"},
+                    "req": {
+                        "module": "music.trackInfo.UniformRuleCtrl",
+                        "method": "CgiGetTrackInfo",
+                        "param": {"types": [1], "ctx": 0},
+                    },
+                }
+                if music_id.startswith("00"):
+                    req_body["req"]["param"]["mids"] = [str(music_id)]
+                else:
+                    req_body["req"]["param"]["ids"] = [int(music_id)]
+                async with session.post(
+                    """https://u.y.qq.com/cgi-bin/musicu.fcg""", json=req_body
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    text_resp = await resp.text()
+                    if not text_resp:
+                        return None
+                    data = json.loads(text_resp)
+                    if not data.get("req"):
+                        return None
+                    song = data["req"]["data"]["tracks"][0]
+                    return {
+                        "title": f"{song['title']} ({song['subtitle']})"
+                        if (song["subtitle"] and len(song["subtitle"]))
+                        else song["title"],
+                        "artist": " / ".join(
+                            [singer["name"] for singer in song["singer"]]
+                        ),
+                        "cover_url": f"https://y.qq.com/music/photo_new/T002R1200x1200M000{song['album']['mid']}.jpg",
+                        "music_id": music_id,
+                    }
+        except Exception as e:
+            print(f"QM API Error: {e}")
+            return None
+
+    @staticmethod
+    async def fetch_apple_music_info(
+        music_id: str, country: str = "cn"
+    ) -> Optional[Dict]:
+        """[异步] 获取 Apple Music (iTunes API) 歌曲详情"""
+        try:
+            from curl_cffi.requests import AsyncSession
+        except ImportError:
+            print("请先安装 curl_cffi 以使用 Apple Music 功能: pip install curl_cffi")
+            return None
+
+        base_url = "https://itunes.apple.com/lookup"
+        params = {"id": music_id, "entity": "song", "country": country, "limit": 1}
+        print(f"正在从 Apple Music API 获取 ID {music_id} 的信息...")
+        try:
+            async with AsyncSession(impersonate="chrome120") as session:
+                response = await session.get(base_url, params=params)
+                if response.status_code != 200:
+                    print(f"AM API Error: {response.status_code}")
+                    return None
+
+                data = response.json()
+                if data["resultCount"] > 0:
+                    song_data = data["results"][0]
+
+                    # 优化：iTunes API 默认返回 100x100 的封面，这里手动替换为高清大图
+                    cover_url = song_data.get("artworkUrl100", "")
+                    if cover_url:
+                        cover_url = cover_url.replace("100x100bb", "1024x1024bb")
+
+                    return {
+                        "title": song_data.get("trackName"),
+                        "artist": song_data.get("artistName"),
+                        "cover_url": cover_url,
+                        "music_id": str(song_data.get("trackId")),
+                        "song_url": song_data.get("trackViewUrl"),
+                    }
+                else:
+                    print(f"未找到歌曲 ID: {music_id}")
+                    return None
+        except Exception as e:
+            print(f"AM API Error: {e}")
+            return None
+
+    @staticmethod
+    async def fetch_daily_recommendation(date_str: str) -> Optional[Dict]:
+        """
+        [异步] 获取每日推荐 (API Priority 1)
+        URL: https://amlldb.bikonoo.com/api/daily-recommendations?date={date}
+        """
+        url = f"https://amlldb.bikonoo.com/api/daily-recommendations?date={date_str}"
+        print(f"正在获取 {date_str} 的每日推荐...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        print(f"Error: {resp.status}")
+                        return None
+
+                    # API 可能返回 "null" 或 JSON 对象
+                    text_resp = await resp.text()
+                    if not text_resp or text_resp.strip() == "null":
+                        print("该日期无每日推荐数据")
+                        return None
+
+                    data = json.loads(text_resp)
+                    # 校验返回数据是否有效
+                    if not isinstance(data, dict) or "ncm_id" not in data:
+                        return None
+
+                    return {
+                        "music_id": data.get("ncm_id"),
+                        "date": data.get("date"),  # "2025-12-17"
+                        "username": data.get("username"),  # -> quote_source
+                        "comment": data.get("comment"),  # -> quote_content
+                        "cover_path": data.get("cover"),  # -> cover_url
+                    }
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
+    # --- 图像处理算法 ---
+
+    @staticmethod
+    def get_dominant_color(image: Image.Image):
+        return (
+            image.copy()
+            .resize((1, 1), resample=Image.Resampling.HAMMING)
+            .getpixel((0, 0))
+        )
+
+    @staticmethod
+    def get_adaptive_month_color(bg_sample, theme_rgb):
+        bg_color = bg_sample.resize((1, 1), resample=Image.Resampling.HAMMING).getpixel(
+            (0, 0)
+        )
+        bg_lum = (bg_color[0] * 299 + bg_color[1] * 587 + bg_color[2] * 114) / 1000
+
+        def adjust(c, factor):
+            return tuple(min(255, max(0, int(i * factor))) for i in c)
+
+        return adjust(theme_rgb, 0.6) if bg_lum > 140 else adjust(theme_rgb, 1.8)
+
+    @staticmethod
+    def get_adaptive_deco_color(bg_sample, theme_rgb):
+        bg_color = bg_sample.resize((1, 1), resample=Image.Resampling.HAMMING).getpixel(
+            (0, 0)
+        )
+        bg_lum = (bg_color[0] * 299 + bg_color[1] * 587 + bg_color[2] * 114) / 1000
+
+        def blend(c1, c2, ratio):
+            return tuple(int(c1[i] * (1 - ratio) + c2[i] * ratio) for i in range(3))
+
+        white = (255, 255, 255)
+        # 亮背景混白色20%，暗背景混白色60%
+        return (
+            blend(theme_rgb, white, 0.2)
+            if bg_lum > 150
+            else blend(theme_rgb, white, 0.6)
+        )
+
+    @staticmethod
+    def get_contrasting_text_color(region_image):
+        color = region_image.resize((1, 1), resample=Image.Resampling.HAMMING).getpixel(
+            (0, 0)
+        )
+        lum = (color[0] * 299 + color[1] * 587 + color[2] * 114) / 1000
+        return "#4a3b32" if lum > 120 else "#f2f2f2"
+
+    @staticmethod
+    def _get_relative_luminance(rgb):
+        """计算 sRGB 颜色的相对亮度"""
+        r, g, b = [x / 255.0 for x in rgb]
+        r = r / 12.92 if r <= 0.03928 else ((r + 0.055) / 1.055) ** 2.4
+        g = g / 12.92 if g <= 0.03928 else ((g + 0.055) / 1.055) ** 2.4
+        b = b / 12.92 if b <= 0.03928 else ((b + 0.055) / 1.055) ** 2.4
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    @classmethod
+    def _get_contrast_ratio(cls, rgb1, rgb2):
+        """计算两种颜色之间的对比度"""
+        lum1 = cls._get_relative_luminance(rgb1)
+        lum2 = cls._get_relative_luminance(rgb2)
+        if lum1 > lum2:
+            return (lum1 + 0.05) / (lum2 + 0.05)
+        else:
+            return (lum2 + 0.05) / (lum1 + 0.05)
+
+    @classmethod
+    def get_safe_qr_color(cls, theme_rgb, bg_color_rgb=(253, 253, 253)):
+        """
+        [最终改进] 确保二维码颜色与实际背景有足够的对比度 (WCAG > 4.5:1)。
+        :param theme_rgb: 原始主题色
+        :param bg_color_rgb: 二维码区域的实际平均背景色
+        """
+        min_contrast_ratio = 4.5
+
+        current_color = list(theme_rgb)
+
+        # 循环调整，直到对比度达标
+        while (
+            cls._get_contrast_ratio(tuple(current_color), bg_color_rgb)
+            < min_contrast_ratio
+        ):
+            # 如果已经是纯黑，则停止
+            if (
+                current_color[0] <= 5
+                and current_color[1] <= 5
+                and current_color[2] <= 5
+            ):
+                return 0, 0, 0
+
+            # 按比例调暗颜色
+            current_color[0] = max(0, int(current_color[0] * 0.9))
+            current_color[1] = max(0, int(current_color[1] * 0.9))
+            current_color[2] = max(0, int(current_color[2] * 0.9))
+
+        return tuple(current_color)
+
+    @staticmethod
+    def generate_styled_qrcode(data, theme_color, size=120):
+        qr = qrcode.QRCode(version=1, border=1, box_size=10)
+        qr.add_data(data)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
+
+        new_data = []
+        tr, tg, tb = theme_color
+        for item in qr_img.getdata():
+            # 黑色 -> 主题色带透明度; 白色 -> 透明
+            if item[0] < 128:
+                new_data.append((tr, tg, tb, 230))
+            else:
+                new_data.append((255, 255, 255, 0))
+        qr_img.putdata(new_data)
+        return qr_img.resize((size, size), Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def create_gradient_mask(w, h):
+        ending = 0.9
+        limit = 255 * ending
+        break_percent = 0.5
+        break_opa = limit * break_percent
+        break_h = min(1100, h * break_percent * ending)
+
+        # 【新增】定义非线性强度 (指数)
+        # exponent = 2.0  -> 平滑 (推荐)
+        # exponent = 3.0  -> 更加平滑，中间部分更透
+        # exponent = 0.5  -> 甚至比线性更加激进 (一过 break_h 就迅速变黑)
+        exponent = 1.5
+
+        data = []
+        for y in range(h):
+            if y < break_h:
+                val = int(break_opa * (y / break_h)) if break_h > 0 else 0
+            else:
+                denom = h - break_h
+                ratio = (y - break_h) / denom if denom > 0 else 1
+
+                # ==========【核心修改】==========
+                # 对 ratio 进行非线性处理
+                ratio = ratio**exponent
+                # ==============================
+
+                val = int(break_opa + (limit - break_opa) * ratio)
+            data.append(val)
+
+        gradient = Image.new("L", (1, h))
+        gradient.putdata(data)
+        return gradient.resize((w, h))
+
+    @staticmethod
+    def create_rounded_mask(size, radius):
+        """
+        [改进] 创建带抗锯齿效果的圆角蒙版。
+        """
+        # 1. 超采样：定义一个放大倍数，2倍、4倍或更高
+        upscale_factor = 8
+
+        # 2. 创建一个放大 upscale_factor 倍的画布
+        scaled_size = (size[0] * upscale_factor, size[1] * upscale_factor)
+        scaled_radius = radius * upscale_factor
+
+        # 3. 在这个大画布上绘制圆角矩形
+        mask = Image.new("L", scaled_size, 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0) + scaled_size, radius=scaled_radius, fill=255)
+
+        # 4. 将大图像高质量地缩小回原始尺寸
+        #    Image.Resampling.LANCZOS 是高质量的缩小算法，能产生平滑的边缘
+        return mask.resize(size, Image.Resampling.LANCZOS)
+
+    # --- 布局与绘制 ---
+
+    @staticmethod
+    def contains_cjk(text: str) -> bool:
+        """
+        检查字符串是否包含 CJK 字符。
+        """
+        for char in text:
+            # CJK 统一表意文字 U+4E00..U+9FFF
+            # CJK 兼容表意文字 U+F900..U+FAFF
+            # ... 还有很多，但这个范围已经能覆盖绝大部分场景
+            if "\u4e00" <= char <= "\u9fff":
+                return True
+        return False
+
+    def _process_text_wrapping(self, draw, text, font, max_width):
+        """
+        [最终国际化版] 智能换行方法。
+        - 对 CJK 文本进行逐字换行，不加连字符。
+        - 对西文文本进行单词间换行，并为超长单词自动添加连字符。
+        """
+        final_lines: list[str] = []
+
+        # 获取基础行高
+        bbox = font.getbbox("高")
+        line_height = bbox[3] - bbox[1]
+
+        for paragraph in text.split("\n"):
+            paragraph = paragraph.strip()
+
+            if not paragraph:
+                final_lines.append("")
+                continue
+
+            # --- 判断文本类型，选择不同策略 ---
+            if self.contains_cjk(paragraph):
+                # --- 策略 A: CJK 文本处理 (逐字换行) ---
+                current_line = ""
+                for char in paragraph:
+                    if draw.textlength(current_line + char, font=font) <= max_width:
+                        current_line += char
+                    else:
+                        if " " in current_line:
+                            final_lines.append(current_line[: current_line.rindex(" ")])
+                            current_line = current_line[current_line.rindex(" ") + 1 :]
+                            current_line += char
+                        else:
+                            final_lines.append(current_line)
+                            current_line = char
+                if current_line:
+                    final_lines.append(current_line)
+            else:
+                # --- 策略 B: 西文文本处理 (基于单词换行) ---
+                words = paragraph.split(" ")
+                current_line = ""
+                for word in words:
+                    # 处理单个单词超长的情况
+                    word_width = draw.textlength(word, font=font)
+                    if word_width > max_width:
+                        if current_line:
+                            final_lines.append(current_line)
+                            current_line = ""
+
+                        hyphen_width = draw.textlength("-", font=font)
+                        effective_max_width = max_width - hyphen_width
+                        temp_chunk = ""
+                        for char in word:
+                            if (
+                                draw.textlength(temp_chunk + char, font=font)
+                                <= effective_max_width
+                            ):
+                                temp_chunk += char
+                            else:
+                                final_lines.append(temp_chunk + "-")
+                                temp_chunk = char
+                        if temp_chunk:
+                            current_line = temp_chunk
+                        continue
+
+                    # 正常的单词拼接逻辑
+                    separator = " " if current_line else ""
+                    test_line = current_line + separator + word
+                    if draw.textlength(test_line, font=font) <= max_width:
+                        current_line = test_line
+                    else:
+                        final_lines.append(current_line)
+                        current_line = word
+                if current_line:
+                    final_lines.append(current_line)
+
+        return final_lines, line_height
+
+    @staticmethod
+    def _draw_text_right(draw, text, font, right_x, y, fill):
+        w = draw.textlength(text, font=font)
+        draw.text((right_x - w, y), text, font=font, fill=fill)
+
+    async def generate(
+        self,
+        data: Dict[str, Any],
+        inner_blurred: bool = False,
+        show_qrcode: bool = False,
+        mode: str = DAILY,
+    ) -> Image.Image:
+        """
+        生成音乐卡片的核心方法
+        :param data: 包含 title, artist, cover_url, quote_content, quote_source, date_obj, music_id
+        :param inner_blurred: 是否开启内部模糊
+        :param show_qrcode: 是否显示二维码
+        :param mode: 制卡模式
+        :return: PIL.Image 对象
+        """
+        # 准备数据
+        title = data.get("title", "")
+        artist = data.get("artist", "")
+        cover_url = data.get("cover_url", "")
+        quote_content = data.get("quote_content", "")
+        quote_source = data.get("quote_source", "")
+        date_obj = data.get("date_obj", datetime.now())
+        music_id = data.get("music_id")
+
+        date_month_str = calendar.month_abbr[date_obj.month]
+        date_day_int = date_obj.day
+
+        # 下载资源
+        print(f"下载封面: {cover_url}")
+        cover_img_raw = (await self.download_image(cover_url)).convert("RGB")
+        theme_rgb = self.get_dominant_color(cover_img_raw)
+        print(f"识别主题色: {theme_rgb}")
+
+        try:
+            font_title = self._load_font(44, self.Semibold)
+            font_artist = self._load_font(26, self.Semibold)
+            font_date_num = self._load_font(90, self.Medium)
+            font_date_month = self._load_font(40, self.Medium)
+            font_quote = self._load_font(34, self.Regular)
+            font_quote_sub = self._load_font(26, self.Light)
+            font_deco = self._load_font(100, self.Medium)
+            font_fc = self._load_font(32, self.Thin)
+            font_fo = self._load_font(22, self.Regular)
+        except IOError as e:
+            print(f"字体加载失败: {self.font_path}, 错误详情: {e}")
+            return Image.new("RGB", (100, 100), color="red")
+
+        # 布局计算
+        QR_SIZE = 120
+        QR_GAP = 20
+
+        # 文字最大宽度 (避让二维码)
+        text_w = self.MAX_TEXT_W
+        if show_qrcode and music_id:
+            text_w -= QR_SIZE + QR_GAP
+
+        temp_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+        # 头部文本高度
+        t_lines, t_h = self._process_text_wrapping(temp_draw, title, font_title, text_w)
+        a_lines, a_h = self._process_text_wrapping(
+            temp_draw, artist, font_artist, text_w
+        )
+
+        text_block_h = (len(t_lines) * t_h * 1.3) + 15 + (len(a_lines) * a_h * 1.5)
+
+        # 头部实际高度 (取文本块与二维码的较大值)
+        header_h_real = (
+            max(text_block_h, QR_SIZE) if (show_qrcode and music_id) else text_block_h
+        )
+
+        q_max_w = 0
+        q_x = 0
+        footer_inner_h = 0
+        header_section_h = 0
+        middle_h = 0
+
+        match mode:
+            case self.CARD:
+                header_section_h = header_h_real
+                middle_h = 0
+                footer_inner_h = 60
+            case self.DAILY | self.LYRIC:
+                header_section_h = (
+                    header_h_real + 30 + 4 + 40
+                )  # + padding + line + padding
+
+                # 中间区域 (日期 & 引言)
+                q_x = self.CONTENT_LEFT_X
+                if mode == self.DAILY:
+                    q_x += 240
+                q_max_w = self.CONTENT_RIGHT_X - q_x
+
+                # -- 精确计算引言/歌词区域高度 --
+                q_h_real = 0
+                font_quote_small = self._load_font(
+                    int(font_quote.size * 0.8), self.Regular
+                )
+                q_bbox = font_quote.getbbox("高")
+                q_font_h = q_bbox[3] - q_bbox[1]
+                small_q_bbox = font_quote_small.getbbox("高")
+                small_q_font_h = small_q_bbox[3] - small_q_bbox[1]
+
+                lines = clean_emojis(quote_content).split("\n")
+                raw_lines = []
+                pure_center = True
+                for line in lines:
+                    match = re.match(r"^\[([:_-]+)\](.*)", line.strip())
+                    if match:
+                        spec, text_content = match.groups()
+                        text_content = text_content.strip()
+                        raw_lines.append((spec, text_content))
+                        if spec != "-":
+                            pure_center &= spec == ":-:" or spec == ":_:"
+                    else:
+                        raw_lines.append((None, line.strip()))
+                for spec, text_content in raw_lines:
+                    if spec:
+                        if spec == "-":
+                            if not text_content.strip():
+                                q_h_real += q_font_h * 0.25
+                            else:
+                                q_h_real += q_font_h * 0.5 + q_font_h / 1.5
+                        else:
+                            use_small_font = "_" in spec or spec == "-"
+                            target_font = (
+                                font_quote_small if use_small_font else font_quote
+                            )
+                            target_font_h = (
+                                small_q_font_h if use_small_font else q_font_h
+                            )
+                            wrap_width = q_max_w * (1 if pure_center else 0.8)
+                            wrapped_sub_lines, _ = self._process_text_wrapping(
+                                temp_draw, text_content.strip(), target_font, wrap_width
+                            )
+                            q_h_real += len(wrapped_sub_lines) * target_font_h * 1.6
+                    else:
+                        if not text_content.strip():
+                            q_h_real += q_font_h * 1.6
+                            continue
+                        wrapped_sub_lines, _ = self._process_text_wrapping(
+                            temp_draw, text_content, font_quote, q_max_w
+                        )
+                        q_h_real += len(wrapped_sub_lines) * q_font_h * 1.6
+
+                if mode == self.DAILY:
+                    # DAILY 模式: 保留为来源和底部预留的完整边距
+                    q_h = q_h_real + 40 + 30
+                    footer_inner_h = 20 + 20 + 32 + 25
+                else:  # LYRIC 模式
+                    # LYRIC 模式: 仅为装饰性引号保留少量边距，并移除底部
+                    q_h = q_h_real + 30
+                    footer_inner_h = 0
+
+                middle_h = max(200, q_h)
+
+        # 总高度
+        cover_size = self.MAX_TEXT_W
+        total_card_h = self.INNER_PAD + cover_size + header_section_h + footer_inner_h
+        if mode != self.CARD:
+            total_card_h += 30 + middle_h
+        total_img_h = int(total_card_h + self.MARGIN_TOP + self.MARGIN_BOTTOM)
+
+        # 绘制主背景
+        bg_img = ImageOps.fit(
+            cover_img_raw, (self.W, total_img_h), method=Image.Resampling.LANCZOS
+        )
+        bg_img = bg_img.filter(ImageFilter.GaussianBlur(radius=100))
+        bg_img = ImageEnhance.Brightness(bg_img).enhance(0.7)
+
+        # 卡片背景
+        if inner_blurred:
+            card_crop = bg_img.crop(
+                (
+                    self.MARGIN_SIDE,
+                    self.MARGIN_TOP,
+                    self.MARGIN_SIDE + self.CARD_W,
+                    self.MARGIN_TOP + total_card_h,
+                )
+            )
+            card_crop = ImageEnhance.Brightness(card_crop).enhance(1.2)
+            white_layer = Image.new("RGB", card_crop.size, "#FDFDFD")
+            mask = self.create_gradient_mask(card_crop.width, card_crop.height)
+            card_bg = Image.composite(white_layer, card_crop, mask)
+        else:
+            card_bg = Image.new("RGB", (self.CARD_W, int(total_card_h)), "#FDFDFD")
+
+        # 贴卡片
+        card_mask = self.create_rounded_mask(card_bg.size, 40)
+        bg_img.paste(card_bg, (self.MARGIN_SIDE, self.MARGIN_TOP), card_mask)
+        draw = ImageDraw.Draw(bg_img)
+
+        # 贴封面
+        cover_resized = ImageOps.fit(
+            cover_img_raw, (cover_size, cover_size), method=Image.Resampling.LANCZOS
+        )
+        bg_img.paste(
+            cover_resized,
+            (self.CONTENT_LEFT_X, self.MARGIN_TOP + self.INNER_PAD),
+            self.create_rounded_mask(cover_resized.size, 30),
+        )
+
+        # 绘制内容
+        cursor_y = self.MARGIN_TOP + self.INNER_PAD + cover_size + 30
+        header_start_y = cursor_y
+
+        # 绘制头部部分
+        # 标题
+        for line in t_lines:
+            draw.text(
+                (self.CONTENT_LEFT_X, cursor_y), line, font=font_title, fill=self.C_MAIN
+            )
+            cursor_y += t_h * 1.3
+        cursor_y += 15
+        # 艺术家
+        for line in a_lines:
+            draw.text(
+                (self.CONTENT_LEFT_X, cursor_y), line, font=font_artist, fill=self.C_SUB
+            )
+            cursor_y += a_h * 1.5
+
+        # 二维码 (头部右侧)
+        if show_qrcode and music_id:
+            song_url = data.get("song_url")
+            if not song_url:
+                if self.platform == "ncm":
+                    song_url = f"https://music.163.com/#/song?id={music_id}"
+                elif self.platform == "qq":
+                    song_url = f"https://y.qq.com/n/ryqq_v2/songDetail/{music_id}"
+                elif self.platform == "am":
+                    song_url = (
+                        f"https://music.apple.com/{self.am_storefront}/song/{music_id}"
+                    )
+
+            # 1. 计算二维码的精确位置和区域
+            qr_x = int(self.CONTENT_RIGHT_X - QR_SIZE)
+            qr_y = int(header_start_y)
+            qr_region_box = (qr_x, qr_y, qr_x + QR_SIZE, qr_y + QR_SIZE)
+
+            # 2. 采样该区域的平均背景色
+            qr_background_sample = bg_img.crop(qr_region_box)
+            avg_bg_color = self.get_dominant_color(qr_background_sample)
+
+            # 3. 使用实际背景色计算安全的二维码颜色
+            safe_qr_color = self.get_safe_qr_color(theme_rgb, avg_bg_color)
+
+            # 4. 生成并粘贴二维码
+            qr_img = self.generate_styled_qrcode(song_url, safe_qr_color, size=QR_SIZE)
+            bg_img.paste(qr_img, (qr_x, qr_y), qr_img)
+
+        sep_y = header_start_y + header_h_real
+        if mode != self.CARD:
+            # 分隔线
+            sep_y = header_start_y + header_h_real + 30
+            for x in range(self.CONTENT_LEFT_X, self.CONTENT_RIGHT_X, 20):
+                draw.ellipse((x, sep_y, x + 4, sep_y + 4), fill=self.C_ACCENT)
+
+            mid_y = sep_y + 40
+
+            # 绘制中间部分
+
+            if mode == self.DAILY:
+                # 日期
+                date_x = self.CONTENT_LEFT_X + 20
+                month_color = self.get_adaptive_month_color(
+                    bg_img.crop((date_x, mid_y, date_x + 80, mid_y + 40)), theme_rgb
+                )
+                draw.text(
+                    (date_x, mid_y),
+                    date_month_str,
+                    font=font_date_month,
+                    fill=month_color,
+                )
+
+                m_bbox = font_date_month.getbbox("A")
+                draw.text(
+                    (date_x, mid_y + (m_bbox[3] - m_bbox[1]) + 10),
+                    str(date_day_int),
+                    font=font_date_num,
+                    fill=self.C_MAIN,
+                )
+
+            # 装饰引号
+            deco_x = self.CONTENT_RIGHT_X - 80
+            deco_y = total_img_h - 260 if mode == self.DAILY else total_img_h - 180
+            deco_color = self.get_adaptive_deco_color(
+                bg_img.crop(
+                    (int(deco_x), int(deco_y), int(deco_x + 60), int(deco_y + 60))
+                ),
+                theme_rgb,
+            )
+            draw.text((deco_x, deco_y), "”", font=font_deco, fill=deco_color)
+
+            # 引言
+            q_curr_y = mid_y + 5
+            # 获取默认字体的行高
+            q_bbox = font_quote.getbbox("高")
+            q_font_h = q_bbox[3] - q_bbox[1]
+
+            # 逐行处理原始引言文本
+            lines = clean_emojis(from_html_escaped(quote_content)).split("\n")
+            raw_lines = []
+            pure_center = True
+            for line in lines:
+                match = re.match(r"^\[([:_-]+)\](.*)", line.strip())
+                if match:
+                    spec, text_content = match.groups()
+                    text_content = text_content.strip()
+                    raw_lines.append((spec, text_content))
+                    if spec != "-":
+                        pure_center &= spec == ":-:" or spec == ":_:"
+                else:
+                    raw_lines.append((None, line.strip()))
+            for spec, text_content in raw_lines:
+                if spec:
+                    if spec == "-":
+                        padding_v = q_font_h * 0.25
+                        if not text_content:
+                            # 情况 1: 内容为空 -> 仅增加 1/4 行高的空白
+                            q_curr_y += padding_v
+                        else:
+                            # 情况 2: 有文本 -> 50%行宽点虚线 + 中间 1/3 大小文本(垂直居中) + 上下留空
+
+                            # 1. 准备字体 (1/3 原大小)
+                            div_font_size = int(font_quote.size / 1.5)
+                            div_font_size = max(8, div_font_size)  # 最小尺寸保护
+                            div_font = self._load_font(div_font_size, self.Regular)
+
+                            # 2. 计算文本尺寸
+                            # 获取文本宽度
+                            div_text_w = draw.textlength(text_content, font=div_font)
+
+                            # 获取参考高度 (使用通用高字符，保证不同行的分割线高度一致)
+                            # 注意：这里获取的是边界框高度，用于计算占位
+                            div_bbox = div_font.getbbox("Hg")
+                            div_text_h = div_bbox[3] - div_bbox[1]
+
+                            # 3. 布局计算 (核心修改)
+                            div_total_w = q_max_w * 0.5
+                            center_x = q_x + q_max_w / 2
+                            area_start_x = center_x - div_total_w * 0.75
+                            area_end_x = center_x + div_total_w * 0.75
+                            text_x = center_x - div_text_w / 2
+                            text_gap = 8
+
+                            # --- 关键修改开始 ---
+                            # 计算垂直中心线 Y 坐标：
+                            # 当前位置 + 上方留白 + 文本高度的一半
+                            div_mid_y = q_curr_y + padding_v + (div_text_h / 2)
+                            # --- 关键修改结束 ---
+
+                            # 4. 绘制流程
+
+                            # 绘制左侧虚线 (在 div_mid_y 高度绘制)
+                            left_line_end = text_x - text_gap
+                            if left_line_end > area_start_x:
+                                for lx in range(
+                                    int(area_start_x), int(left_line_end), 4
+                                ):
+                                    draw.point((lx, div_mid_y), fill=self.C_QUOTE)
+
+                            # --- 关键修改开始 ---
+                            # 绘制中间文本 (使用 anchor="lm" 实现垂直居中)
+                            # anchor="lm" 表示传入的坐标 (text_x, div_mid_y) 是文本的 "Left Middle" (左侧中间点)
+                            draw.text(
+                                (text_x, div_mid_y),
+                                text_content,
+                                font=div_font,
+                                fill=self.C_QUOTE,
+                                anchor="lm",
+                            )
+                            # --- 关键修改结束 ---
+
+                            # 绘制右侧虚线 (在 div_mid_y 高度绘制)
+                            right_line_start = text_x + div_text_w + text_gap
+                            if right_line_start < area_end_x:
+                                for lx in range(
+                                    int(right_line_start), int(area_end_x), 4
+                                ):
+                                    draw.point((lx, div_mid_y), fill=self.C_QUOTE)
+
+                            # 更新 Y 轴：加上方留空 + 文本本身高度 + 下方留空
+                            q_curr_y += padding_v + div_text_h + padding_v
+                    else:
+                        # --- 情况 A: 行首有对齐标记 ---
+                        # 1. 确定字体
+                        use_small_font = "_" in spec
+                        font_size = (
+                            int(font_quote.size * 0.8)
+                            if use_small_font
+                            else font_quote.size
+                        )
+                        target_font = (
+                            self._load_font(font_size, self.Regular)
+                            if use_small_font
+                            else font_quote
+                        )
+                        target_bbox = target_font.getbbox("高")
+                        target_font_h = target_bbox[3] - target_bbox[1]
+
+                        # 2. 确定对齐方式
+                        norm_spec = spec.replace("_", "-")
+                        align = "left"  # 默认为左对齐
+                        if ":-:" in norm_spec:
+                            align = "center"
+                        elif "-:" in norm_spec:
+                            align = "right"
+
+                        # 3. 文本换行 (使用 80% 宽度)
+                        wrap_width = q_max_w * (1 if pure_center else 0.8)
+                        margin_w = q_max_w * 0.1
+                        wrapped_sub_lines, _ = self._process_text_wrapping(
+                            draw, text_content, target_font, wrap_width
+                        )
+
+                        # 4. 绘制换行后的每一行
+                        for sub_line in wrapped_sub_lines:
+                            sub_line_width = draw.textlength(sub_line, font=target_font)
+
+                            x_pos = q_x  # 默认是 `:-` (左对齐)
+                            if align == "center":  # `:-:` (居中)
+                                x_pos = (q_x + margin_w * int(not pure_center)) + (
+                                    wrap_width - sub_line_width
+                                ) / 2
+                            elif align == "right":  # `-:` (右对齐)
+                                # 对齐到整个可用区域的右侧
+                                x_pos = (q_x + q_max_w) - sub_line_width
+
+                            draw.text(
+                                (x_pos, q_curr_y),
+                                sub_line,
+                                font=target_font,
+                                fill=self.C_QUOTE,
+                            )
+                            q_curr_y += target_font_h * 1.6
+
+                else:
+                    # --- 情况 B: 普通行 (默认行为) ---
+                    if not text_content:  # 处理空行
+                        q_curr_y += q_font_h * 1.6
+                        continue
+
+                    # 1. 文本换行 (使用 100% 宽度)
+                    wrapped_sub_lines, _ = self._process_text_wrapping(
+                        draw, text_content, font_quote, q_max_w
+                    )
+
+                    # 2. 绘制换行后的每一行
+                    for sub_line in wrapped_sub_lines:
+                        draw.text(
+                            (q_x, q_curr_y),
+                            sub_line,
+                            font=font_quote,
+                            fill=self.C_QUOTE,
+                        )
+                        q_curr_y += q_font_h * 1.6
+
+            # 来源
+            if mode == self.DAILY:
+                self._draw_text_right(
+                    draw,
+                    "--来自 @" + quote_source + " 的评论",
+                    font_quote_sub,
+                    self.CONTENT_RIGHT_X,
+                    q_curr_y + 20,
+                    self.C_SUB,
+                )
+
+                # 虚线分隔符 & 文字
+                bot_sep_y = mid_y + middle_h + 10
+                for x in range(self.CONTENT_LEFT_X, self.CONTENT_RIGHT_X, 20):
+                    draw.ellipse(
+                        (x, bot_sep_y, x + 4, bot_sep_y + 4), fill=self.C_ACCENT
+                    )
+
+                foot_base_y = bot_sep_y
+                foot_y = foot_base_y + 24
+                ct = "AMLL 亲友团 | 今日推荐"
+                ct_bbox = draw.textbbox((0, 0), ct, font=font_fc)
+                draw.text(
+                    (
+                        self.MARGIN_SIDE
+                        + (self.CARD_W - (ct_bbox[2] - ct_bbox[0])) / 2,
+                        foot_y,
+                    ),
+                    ct,
+                    font=font_fc,
+                    fill=self.C_FOOTER_CENTER,
+                )
+        else:
+            foot_base_y = sep_y
+
+        # 水印
+        outer_y = self.MARGIN_TOP + total_card_h + 20
+        outer_right_x = self.MARGIN_SIDE + self.CARD_W
+        outer_color = self.get_contrasting_text_color(
+            bg_img.crop((self.W - 300, total_img_h - 80, self.W, total_img_h))
+        )
+
+        self._draw_text_right(
+            draw,
+            "Designed by HamuChan & Gemini",
+            font_fo,
+            outer_right_x,
+            outer_y,
+            outer_color,
+        )
+        self._draw_text_right(
+            draw,
+            "Generated by 1412's Laptop",
+            font_fo,
+            outer_right_x,
+            outer_y + 30,
+            outer_color,
+        )
+
+        # 左侧二维码 (外部)
+        # if show_qrcode and music_id:
+        #    song_url = f"https://music.163.com/#/song?id={music_id}"
+        #    ext_qr = self.generate_styled_qrcode(song_url, theme_rgb, size=80)
+        #    bg_img.paste(ext_qr, (self.MARGIN_SIDE, int(outer_y)-5), ext_qr)
+
+        return bg_img
+
+
+def from_html_escaped(text: str) -> str:
+    return (
+        text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+
+
+def clean_emojis(text: str) -> str:
+    language_pack: Dict[str, str] = {
+        data["en"]: em
+        for em, data in emoji.EMOJI_DATA.items()
+        if "en" in data and data["status"] <= emoji.STATUS["fully_qualified"]
+    }
+    emoji_regex = "|".join(
+        map(re.escape, sorted(language_pack.values(), key=len, reverse=True))
+    )
+    return re.sub(emoji_regex, " ", text)
+
+
+async def fetch_lines(music_id: str, platform: str):
+    folder = {"ncm": "ncm-lyrics", "qq": "qq-lyrics", "am": "am-lyrics"}
+    if platform not in folder:
+        print(f"目前不支持平台 {platform} 的歌词获取")
+        return None
+
+    url = f"{TTML_DB_URL_PREFIX}/{folder[platform]}/{music_id}.ttml"
+    print(f"正在从 {url} 获取 {music_id} 的 TTML 文件...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"Error: {resp.status}")
+                    return None
+
+                # API 可能返回 "null" 或 JSON 对象
+                text_resp = await resp.text()
+                if not text_resp or text_resp.strip() == "null":
+                    print("该 ID 所对应歌词还无人制作")
+                    return None
+
+                return TTML(text_resp).text
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
+import os
+import shutil
+
+
+def resolve_font_path(user_font_arg: Optional[str]) -> str:
+    """
+    解析并管理字体路径：
+    1. 如果用户指定了字体文件，将其复制到同级 font 文件夹下，并作为下次的默认字体。
+    2. 如果用户未指定，优先从同级 font 文件夹中读取单文件字体。
+    3. 如果没有单文件字体，回退到内置的 SourceHanSansSC 思源黑体目录。
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    font_dir = os.path.join(base_dir, "font")
+    shs_dir = os.path.join(font_dir, "SourceHanSansSC")
+    os.makedirs(font_dir, exist_ok=True)
+
+    supported_exts = (".ttf", ".ttc", ".otf")
+
+    # 1. 用户显式指定了字体
+    if user_font_arg:
+        if not os.path.exists(user_font_arg):
+            print(f"⚠️ 指定的字体文件不存在: {user_font_arg}，将尝试使用默认字体。")
+        elif os.path.isdir(user_font_arg):
+            return user_font_arg
+        else:
+            # 清空 font 文件夹中的旧单文件字体，确保新字体成为唯一默认
+            for f in os.listdir(font_dir):
+                f_path = os.path.join(font_dir, f)
+                if os.path.isfile(f_path) and f.lower().endswith(supported_exts):
+                    try:
+                        os.remove(f_path)
+                    except Exception as e:
+                        print(f"⚠️ 无法删除旧字体文件 {f}: {e}")
+
+            # 复制新字体到 font 文件夹
+            dest_path = os.path.join(font_dir, os.path.basename(user_font_arg))
+            if os.path.abspath(user_font_arg) != os.path.abspath(dest_path):
+                try:
+                    shutil.copy2(user_font_arg, dest_path)
+                    print(f"✅ 已将字体保存至: {dest_path}，下次将默认使用。")
+                except Exception as e:
+                    print(f"⚠️ 无法复制字体文件到 {dest_path}: {e}")
+            return dest_path
+
+    # 2. 用户未指定，从 font 文件夹中查找单文件
+    for f in os.listdir(font_dir):
+        f_path = os.path.join(font_dir, f)
+        if os.path.isfile(f_path) and f.lower().endswith(supported_exts):
+            return f_path
+
+    # 3. 回退到内置的 SourceHanSansSC 文件夹
+    if os.path.exists(shs_dir) and os.path.isdir(shs_dir):
+        return shs_dir
+
+    return "SourceHanSansSC"
+
+
+# --- 逻辑控制入口 ---
+
+
+async def generate_music_card_process(
+    platform: str,
+    mode: str,
+    date_str: str,
+    music_id_arg: Optional[str] = None,
+    info_arg: Optional[list] = None,
+    quote_arg: Optional[list] = None,
+    inner_blurred: bool = False,
+    show_qrcode: bool = False,
+    font_path: str = "SourceHanSansSC",
+    am_storefront: str = "cn",
+) -> Optional[tuple[Image.Image, str]]:
+    """
+    逻辑控制中心：根据优先级获取数据并调用绘图
+    优先级：每日推荐 API > 命令行 MUSIC ID > 命令行手动 Info
+    """
+    card_gen = MusicCard(font_path, platform, am_storefront)
+    final_data = {}
+
+    # 初始化日期对象
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        print(f"⚠️ 日期格式错误 ({date_str})，使用今日")
+        date_obj = datetime.now()
+        date_str = date_obj.strftime("%Y-%m-%d")
+
+    final_data["date_obj"] = date_obj
+    daily_data = None
+
+    if mode == MusicCard.DAILY:
+        # 尝试获取每日推荐
+        daily_data = await card_gen.fetch_daily_recommendation(date_str)
+
+    if daily_data:
+        print("成功获取每日推荐数据")
+        # 从每日推荐中提取 music_id 和推荐语
+        rec_music_id = daily_data.get("music_id")
+        if rec_music_id:
+            # 补充歌曲信息
+            song_info = None
+            if platform == "ncm":
+                song_info = await card_gen.fetch_ncm_song_info(rec_music_id)
+            elif platform == "qq":
+                song_info = await card_gen.fetch_qq_music_info(rec_music_id)
+            elif platform == "am":
+                song_info = await card_gen.fetch_apple_music_info(
+                    rec_music_id, country=am_storefront
+                )
+
+            if song_info:
+                cover = daily_data.get("cover_path")
+                if cover and cover != "/tj/wfm.jpg":
+                    if cover[0] == "/":
+                        song_info["cover_url"] = "https://amlldb.bikonoo.com" + cover
+                    else:
+                        song_info["cover_url"] = cover
+                final_data.update(song_info)  # title, artist, cover_url, music_id
+
+        # 覆盖引言
+        if daily_data.get("comment"):
+            final_data["quote_content"] = daily_data["comment"]
+        if daily_data.get("username"):
+            src = daily_data["username"]
+            final_data["quote_source"] = src  # if src.startswith("-") else f"- {src}"
+
+    else:
+        # 回退到 NCM ID 参数
+        if mode == MusicCard.DAILY:
+            print("无每日推荐或获取失败，检查命令行参数...")
+
+        if music_id_arg:
+            song_info = None
+            if platform == "ncm":
+                song_info = await card_gen.fetch_ncm_song_info(music_id_arg)
+            elif platform == "qq":
+                song_info = await card_gen.fetch_qq_music_info(music_id_arg)
+            elif platform == "am":
+                song_info = await card_gen.fetch_apple_music_info(
+                    music_id_arg, country=am_storefront
+                )
+
+            if song_info:
+                final_data.update(song_info)
+        # 回退到手动 Info 参数
+        elif info_arg and len(info_arg) == 3:
+            final_data["title"] = info_arg[0]
+            final_data["artist"] = info_arg[1]
+            final_data["cover_url"] = info_arg[2]
+
+    # 检查是否具备生成条件
+    if "title" not in final_data:
+        print(
+            "错误: 无法获取歌曲信息 (Daily API 返回值为空, 且未提供有效 NCM ID 或 Info)"
+        )
+        return None
+
+    # 处理手动引言 (仅当 API 未提供引言时，才使用命令行参数覆盖默认值)
+    # 如果 Daily API 已经填入了 quote_content，则忽略命令行 quote
+    if "quote_content" not in final_data:
+        if mode == MusicCard.LYRIC:
+            lines = await fetch_lines(final_data["music_id"], platform)
+            if not lines:
+                print(
+                    "错误: 无法获取歌曲信息 (Daily API 返回值为空, 且未提供有效 NCM ID 或 Info)"
+                )
+                return None
+            final_data["quote_content"] = lines
+        elif quote_arg and len(quote_arg) == 2:
+            final_data["quote_content"] = quote_arg[0].replace("\\n", "\n")
+            final_data["quote_source"] = quote_arg[1]
+        else:
+            # 默认引言
+            final_data["quote_content"] = "想要和你一起 一同实现远大的梦想"
+            final_data["quote_source"] = "RuriChan"
+
+    # 生成图片
+    return (
+        await card_gen.generate(final_data, inner_blurred, show_qrcode, mode)
+    ), final_data["music_id"]
+
+
+# --- 命令行入口 ---
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="生成仿网易云音乐风格的音乐卡片")
+    parser.add_argument(
+        "--platform",
+        type=str,
+        choices=["ncm", "qq", "am"],
+        default="ncm",
+        help="获取歌曲的平台 ncm/qq/am",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["daily", "card", "lyric"],
+        default="daily",
+        help="制卡模式",
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        default=datetime.now().strftime("%Y-%m-%d"),
+        help="日期 YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--info",
+        nargs=3,
+        metavar=("TITLE", "ARTIST", "COVER_URL"),
+        help="手动指定歌曲信息",
+    )
+    parser.add_argument(
+        "--quote", nargs=2, metavar=("CONTENT", "SOURCE"), help="引言内容与来源"
+    )
+    parser.add_argument("--inner-blurred", action="store_true", help="卡片内部背景模糊")
+    parser.add_argument("--qrcode", action="store_true", help="生成二维码")
+    parser.add_argument("--music-id", type=str, help="歌曲 ID")
+    parser.add_argument(
+        "--am-storefront", type=str, default="cn", help="Apple Music 商店地区 (默认 cn)"
+    )
+    parser.add_argument(
+        "--font",
+        type=str,
+        default=None,
+        help="自定义字体文件路径 (默认从同级 font 文件夹读取，或使用 SourceHanSansSC 思源黑体)",
+    )
+
+    args = parser.parse_args()
+
+    font_path = resolve_font_path(args.font)
+
+    img, music_id = await generate_music_card_process(
+        platform=args.platform,
+        mode=args.mode,
+        date_str=args.date,
+        music_id_arg=args.music_id,
+        info_arg=args.info,
+        quote_arg=args.quote,
+        inner_blurred=args.inner_blurred,
+        show_qrcode=args.qrcode,
+        font_path=font_path,
+        am_storefront=args.am_storefront,
+    )
+
+    if img:
+        filename = ""
+        match args.mode:
+            case MusicCard.LYRIC:
+                filename = f"music_lyric_{music_id}.png"
+            case MusicCard.CARD:
+                filename = f"music_card_{music_id}.png"
+            case MusicCard.DAILY:
+                filename = f"music_card_{args.date}.png"
+        img.save(filename)
+        print(f"图片保存成功: {filename}")
+        # img.show()
+
+
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
