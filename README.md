@@ -124,7 +124,8 @@ Win用户可直接打开 `daily.bat` 使用
 
 ## 致谢
 
-本项目使用了 [Google Gemini](https://aistudio.google.com/app/prompts/new_chat?model=gemini-3-pro-preview) 辅助开发。
+- 本项目使用了 [Google Gemini](https://gemini.google.com) 辅助开发。
+- 本项目的原作者为[@bywhite0](https://github.com/bywhite0)，因操作失误不想改遂与主仓库断绝了fork关系。
 
 ## 许可
 
