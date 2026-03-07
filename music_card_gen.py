@@ -868,17 +868,6 @@ class MusicCard:
                     fill=self.C_MAIN,
                 )
 
-            # 装饰引号
-            deco_x = self.CONTENT_RIGHT_X - 80
-            deco_y = total_img_h - 260 if mode == self.DAILY else total_img_h - 180
-            deco_color = self.get_adaptive_deco_color(
-                bg_img.crop(
-                    (int(deco_x), int(deco_y), int(deco_x + 60), int(deco_y + 60))
-                ),
-                theme_rgb,
-            )
-            draw.text((deco_x, deco_y), "”", font=font_deco, fill=deco_color)
-
             # 引言
             q_curr_y = mid_y + 5
             # 获取默认字体的行高
