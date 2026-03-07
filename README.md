@@ -108,6 +108,9 @@ if __name__ == "__main__":
 
 ### 示例
 
+Win用户可直接打开 `daily.bat` 使用
+
+终端：
 ```plaintext
 --platform ncm --mode daily --date 2025-12-28 --quote "[:-]Frozen into icy rocks, that's how it starts\n[:_]that's how it starts\n[-:]Crumbled like the sands of time, that's how it ends\n[_:]That's how it ends\n[:-]Every page of tragedy is thrown away\n[:_]Is thrown away\n[:-:]Burned out in the flame\n[:_:]In the flame" "May all the beauty be blessed" --inner-blurred --qrcode --music-id 1859652717
 ```
