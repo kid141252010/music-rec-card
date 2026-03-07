@@ -1036,7 +1036,7 @@ class MusicCard:
             if mode == self.DAILY:
                 self._draw_text_right(
                     draw,
-                    "--来自 @" + quote_source + " 的评论",
+                    "来自 @" + quote_source + " 的评论",
                     font_quote_sub,
                     self.CONTENT_RIGHT_X,
                     q_curr_y + 20,
