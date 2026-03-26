@@ -1,0 +1,63 @@
+name: Generate Daily Music Card
+
+on:
+  schedule:
+    # 每天北京时间 08:00 (UTC 00:00) 运行一次
+    # 如果你想在北京时间 00:00 运行，请修改为 '0 16 * * *'
+    - cron: '0 16 * * *'
+  # 允许在 GitHub Actions 页面手动点击运行
+  workflow_dispatch:
+
+jobs:
+  build-and-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 允许 Action 将生成的图片推送到你的仓库
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate daily card
+        env:
+          TZ: Asia/Shanghai # 设置为北京时间，确保卡片日期正确
+        run: |
+          # 运行你的生成脚本（参数与 daily.bat 保持一致）
+          python music_card_gen.py --platform am --mode lyric --music-id 1887230879 --qrcode --inner-blurred
+          
+          # 确保目标文件夹存在
+          mkdir -p "img/AMLL-Daily"
+          
+          # 将生成的卡片移动到目标目录
+          mv music_card_*.png "img/AMLL-Daily/"
+
+      - name: Commit and push changes
+        env:
+          TZ: Asia/Shanghai
+        run: |
+          # 配置 Git 提交信息
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # 将新生成的图片添加到 Git
+          git add "img/AMLL-Daily/"
+          
+          # 检查是否有改动并提交
+          if git diff --staged --quiet; then
+            echo "没有新的改动需要提交"
+          else
+            TODAY=$(date +"%Y-%m-%d")
+            git commit -m "chore(daily): 添加 ${TODAY} 的日推卡片"
+            git push
+          fi
