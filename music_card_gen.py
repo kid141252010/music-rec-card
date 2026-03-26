@@ -16,7 +16,7 @@ import emoji
 
 from ttml.ttml import TTML
 
-TTML_DB_URL_PREFIX = "https://github.com/kid141252010/amll-ttml-db"
+TTML_DB_URL_PREFIX = "https://raw.githubusercontent.com/kid141252010/amll-ttml-db"
 
 
 class MusicCard:
