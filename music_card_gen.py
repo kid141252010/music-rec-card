@@ -1369,7 +1369,7 @@ async def main():
     parser.add_argument("--qrcode", action="store_true", help="生成二维码")
     parser.add_argument("--music-id", type=str, help="歌曲 ID")
     parser.add_argument(
-        "--am-storefront", type=str, default="cn", help="Apple Music 商店地区 (默认 cn)"
+        "--am-storefront", type=str, default="us", help="Apple Music 商店地区 (默认 US)"
     )
     parser.add_argument(
         "--font",
