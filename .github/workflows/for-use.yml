@@ -1,4 +1,4 @@
-name: Generate Daily Music Card
+name: AM-ID
 
 on:
   schedule:
