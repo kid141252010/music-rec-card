@@ -265,7 +265,7 @@ class MusicCard:
                     # 优化：iTunes API 默认返回 100x100 的封面，这里手动替换为高清大图
                     cover_url = song_data.get("artworkUrl100", "")
                     if cover_url:
-                        cover_url = cover_url.replace("100x100bb", "1024x1024bb")
+                        cover_url = cover_url.replace("100x100bb", "5000x5000bb")
 
                     return {
                         "title": song_data.get("trackName"),
