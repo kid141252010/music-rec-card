@@ -34,7 +34,7 @@ jobs:
           TZ: Asia/Shanghai # 设置为北京时间，确保卡片日期正确
         run: |
           # 运行你的生成脚本（参数与 daily.bat 保持一致）
-          python music_card_gen.py --platform am --mode lyric --music-id 1887230888 --qrcode --inner-blurred
+          python music_card_gen.py --platform am --mode lyric --music-id 1827894497 --qrcode --inner-blurred
           
           # 确保目标文件夹存在
           mkdir -p "img/AMLL-Daily"
